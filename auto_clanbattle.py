@@ -54,7 +54,6 @@ logger = log.new_logger(__name__, config.DEBUG)
 
 current_folder = dirname(__file__)
 img_folder = join(current_folder, 'img')
-secret_folder = join(current_folder, 'secret')
 font_file = join(img_folder, 'pcrcnfont.ttf')
 
 cqbot = get_bot()
@@ -260,10 +259,8 @@ async def init_monitor(bot:HoshinoBot, ev:CQEvent):
 async def monitor_loop():
 	try:
 		tasks = []
-		for item in os.scandir(secret_folder):
-			group_id = item.name.split('.')[0]
-			group_info = secret.get_sec(group_id)
-			if not group_info or group_info['monitor_flag'] == 0: continue	#不开启出刀监控的群直接跳过
+		for group_id, group_info in secret.get_group_infos().items():
+			if group_info['monitor_flag'] == 0: continue	#不开启出刀监控的群直接跳过
 			tasks.append(monitor_task(group_id))
 		if len(tasks) > 0: await asyncio.gather(*tasks)
 	except Exception as e:
