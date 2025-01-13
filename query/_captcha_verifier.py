@@ -6,8 +6,6 @@ from nonebot import on_command
 from json import loads
 from typing import Dict
 import asyncio
-from .aiorequests import get
-from asyncio import sleep
 logger = log.new_logger(__name__, config.DEBUG)
 
 gs_commandPrefix = 'cv'

@@ -4,19 +4,19 @@ import re
 import time
 import base64
 import random
-import sqlite3
 import datetime
 import aiocqhttp
 
 from io import BytesIO
-from asyncio import Lock
 from hoshino import aiorequests as requests
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from hoshino.typing import CQEvent, HoshinoBot
-from typing import Dict, List, Tuple, Union, Set
+from typing import Dict
 from hoshino.modules.priconne import _pcr_data, chara
-from hoshino.typing import MessageSegment, CQHttpError
+from hoshino.typing import MessageSegment
 from hoshino import priv, R, util, log, config, Service
+import numpy as np
+from collections import Counter
 
 try:	#怡宝的pcr账号管理模块，可以和怡宝的清日常插件用同一个
 	from ..autopcr.query import query
@@ -38,8 +38,8 @@ help_msg = '''需先完成以下操作才可用：
 [关闭会战推送]: 关闭会战自动报刀推送
 [出刀监控状态]: 查看当前群的自动报刀状态
 [会战状态]: 当前所有boss血量和成员出刀情况（一图流）
-[切换账号 pcr账号]: 可私聊机器人发送多个pcr账号，当需要上其中一个号时可切换另一个账号，使自动报刀不会停止
-[删除监控账号 pcr账号]: 删除绑定的pcr账号，后续不能用该账号进行监控
+[切换账号 账号编号]: 可私聊机器人发送多个pcr账号，当需要上其中一个号时可切换另一个账号，使自动报刀不会停止
+[删除监控账号 账号编号]: 删除绑定的pcr账号，后续不能用该账号进行监控
 [会战预约(1/2/3/4/5)]: 预约提醒
 [预约表/会战表]: 查看所有预约
 [清空预约表]: (仅管理员可用)
@@ -58,6 +58,8 @@ font_file = join(img_folder, 'pcrcnfont.ttf')
 
 cqbot = get_bot()
 secret = Secret()
+event_cache = {}
+chat_list = {}
 
 setting = join(current_folder, 'setting.json')
 def save_setting(dic):
@@ -79,6 +81,17 @@ side = get_setting()['side']						#阶段数
 RANK_LIST = get_setting()['rank_list']				#查档线等待修改和上传图片
 max_chat_list = get_setting()['max_chat_list']		#最多记录多少条留言
 loop_interval = get_setting()['loop_interval']		#循环检测间隔
+
+def get_new_account_number(account_list):
+	if not account_list or len(account_list) == 0:
+		return 0
+	num_list = []
+	for _, account_info in account_list.items():
+		num_ = 'num' in account_info and account_info['num']
+		num_list.append(num_)
+	for num in range(30):
+		if num not in num_list:
+			return num
 
 @sv.on_prefix(("clan"))
 # clan <群号> <pcr账号> <密码>
@@ -121,14 +134,16 @@ async def upload_account_all(bot: HoshinoBot, ev: CQEvent, p_msg = None, is_priv
 			'pre_push':[[],[],[],[],[]],	#预约表
 			'boss_status':[0,0,0,0,0],		#boss状态表
 			'arrow':0,						#出刀id
-			'in_game':[0,0,0,0,0],			#实战中
-			'in_game_old':[0,0,0,0,0],		#实战中
-			'fighter_num':0,				#实战人数
+			'in_game':[0,0,0,0,0],			#90s实战中人数
+			'in_game_old':[0,0,0,0,0],		#实战中总人数
 			'in_game_calc_mode':0,			#实战中显示模式，0为显示90秒内的，1为显示进入且报刀后的
 			'text_mode':0,					#状态显示是否为文字模式，0为图片，1为文字
 			'bot_qqid':ev.self_id,			#机器人自己的qq号
 			'group_id':group_id,			#群号
+			'execute_flag':False			#正在执行查询
 		}
+	account_list = group_info['account_list']
+	if len(account_list) >= 30 : return await bot.send(ev, "超过最大可录入账号数量")
 
 	for i in range(len(msg)):
 		msg[i] = msg[i].replace('"', '')
@@ -138,13 +153,14 @@ async def upload_account_all(bot: HoshinoBot, ev: CQEvent, p_msg = None, is_priv
 	account = ev.group_id and msg[0] or msg[1]
 	password = ev.group_id and msg[1] or msg[2]
 	qq_id = str(ev.user_id)
-	account_list = group_info['account_list']
 	st = "更新"
 	if account not in account_list:
+		num = get_new_account_number(account_list)
 		account_list[account] = {
 			'account':account,
 			'password':password,
-			'qqid':qq_id
+			'qqid':qq_id,
+			'num': num
 		}
 		st = "获取"
 	else:
@@ -156,11 +172,7 @@ async def upload_account_all(bot: HoshinoBot, ev: CQEvent, p_msg = None, is_priv
 
 	try:
 		accountInfo = {"account": account, "password": password, "access_key": '', "uid": '', "qqid": int(qq_id)}
-		access_key, uid = await query.VerifyAccount(accountInfo)
-		account_info["access_key"] = access_key
-		account_info["uid"] = uid
-		account_info["pcrname"] = await query.get_username(accountInfo)
-		account_info["pcrid"] = await query.get_pcrid(accountInfo)
+		await clean_login(account_info, accountInfo)
 		group_info['tvid'] = await query.get_pcrid(accountInfo)
 		group_info['coin'] = await query.get_item_stock(accountInfo, 90006)
 		group_info['now_monitor_account'] = account
@@ -170,6 +182,12 @@ async def upload_account_all(bot: HoshinoBot, ev: CQEvent, p_msg = None, is_priv
 		await bot.send(ev, f'{qq_id}的记录已{st}\naccount={account}\n账号密码检验不通过：{e}，已置为错误。')
 	secret.add_group_info(group_id, group_info)
 
+async def clean_login(account_info, accountInfo):
+    access_key, uid = await query.VerifyAccount(accountInfo, clean_cache = True)
+    account_info["access_key"] = access_key
+    account_info["uid"] = uid
+    account_info["pcrname"] = await query.get_username(accountInfo)
+    account_info["pcrid"] = await query.get_pcrid(accountInfo)
 
 async def _account_verify(bot: HoshinoBot, ev: CQEvent, group_id, ret = 0):
 	out_put = ""
@@ -191,12 +209,16 @@ async def _account_verify(bot: HoshinoBot, ev: CQEvent, group_id, ret = 0):
 			# await bot.send(ev, f'pcrname = {account_info["pcrname"]} pcrid={account_info["pcrid"]} 验证通过')
 		else: out_put = f'pcrname = {account_info["pcrname"]} pcrid={account_info["pcrid"]} 验证通过'
 	except Exception as e:
-		if ret == 2:
-			raise RuntimeError(f'群 {group_id} 的pcr账号 {account_info["account"]} 验证失败: {e}')
-		elif ret == 0:
-			await bot.send(ev, f'群 {group_id} 的pcr账号 {account_info["account"]} 验证失败: {e}')
-		else:
-			out_put = f'群 {group_id} 的pcr账号 {account_info["account"]} 验证失败: {e}'
+		try:
+			accountInfo = {"account": account_info["account"], "password": account_info["password"], "access_key": '', "uid": '', "qqid": ev.user_id}
+			await clean_login(account_info, accountInfo)
+		except Exception as e:
+			if ret == 2:
+				raise RuntimeError(f'群 {group_id} 的pcr账号 {account_info["account"]} 验证失败: {e}')
+			elif ret == 0:
+				await bot.send(ev, f'群 {group_id} 的pcr账号 {account_info["account"]} 验证失败: {e}')
+			else:
+				out_put = f'群 {group_id} 的pcr账号 {account_info["account"]} 验证失败: {e}'
 
 	return out_put
 
@@ -260,7 +282,7 @@ async def monitor_loop():
 	try:
 		tasks = []
 		for group_id, group_info in secret.get_group_infos().items():
-			if group_info['monitor_flag'] == 0: continue	#不开启出刀监控的群直接跳过
+			if group_info['monitor_flag'] == 0 : continue	#跳过不开启出刀监控或正在执行的群
 			tasks.append(monitor_task(group_id))
 		if len(tasks) > 0: await asyncio.gather(*tasks)
 	except Exception as e:
@@ -268,34 +290,35 @@ async def monitor_loop():
 
 async def monitor_task(group_id):
 	group_info = secret.get_sec(group_id)
+	group_info['execute_flag'] = True
 
 	try:
-		# await _account_verify({}, {}, group_id, 2)
-
 		now_monitor_account = group_info['now_monitor_account']			#当前监控的账号
 		account_info = group_info['account_list'][now_monitor_account]	#当前监控的账号信息
 
 		load_index = await query.get_load_index(account_info)			#获取玩家数据
-		group_info['tvid'] = await query.get_pcrid(account_info)			#更新正在监控的玩家id
+		group_info['tvid'] = await query.get_pcrid(account_info)		#更新正在监控的玩家id
 		if group_info['coin'] == 0 or group_info['renew_coin'] > 0:		#初始化获取硬币数/检测到boss状态发生变化后更新会战币
 			group_info['coin'] = await query.get_item_stock(account_info, 90006)	#获取会战币
 
-		msg, clan_battle_info, clan_info, exception_flag = [], 0, 0, False
+		msg, clan_battle_info, clan_info = [], 0, 0
 		while(True):
 			try:
 				clan_info = await query.get_clan_info(account_info)
 				clan_id = clan_info['clan']['detail']['clan_id']
-				clan_battle_info = await query.get_clan_battle_info(account_info, clan_id, group_info['coin'])
+				clan_battle_info = await query.get_clan_battle_info(account_info, clan_id)
 				if group_info['renew_coin'] > 0: group_info['renew_coin'] -= 1
 				break
 			except Exception as e:
 				if ('连接中断' or '发生了错误(E)') in str(e):
-					await cqbot.send_group_msg(group_id = group_id, self_id = group_info['bot_qqid'], message = f'发生错误：{str(e)}\n账号 {load_index["user_info"]["user_name"]} 可能被顶号，已自动关闭推送。如需上号请`切换账号`或`切换会战推送`')
+					msg = f'发生错误：{str(e)}\n账号 {load_index["user_info"]["user_name"]} 可能被顶号，已自动关闭推送。如需上号请`切换账号`或`切换会战推送`'
+					if group_id in event_cache: return await cqbot.send(event_cache[group_id], msg)
+					else: await cqbot.send_group_msg(group_id = int(group_id), self_id = group_info['bot_qqid'], message = msg)
 					group_info['monitor_flag'] = 0
-					exception_flag = True; break
+					group_info['execute_flag'] = False
+					return
 				load_index = await query.get_load_index(account_info)    #击败BOSS时会战币会变动
 				group_info['coin'] = await query.get_item_stock(account_info, 90006)
-		if exception_flag: return
 
 		#判定是否处于会战期间
 		is_interval = load_index['clan_battle']['is_interval']
@@ -306,7 +329,9 @@ async def monitor_task(group_id):
 			mode_change_limit = time.strftime("%Y-%m-%d %H:%M:%S",time.localtime(mode_change_limit))
 			msg = f'当前会战未开放，请在会战前一天发送 初始化会战推送\n会战模式可切换时间{mode_change_open}-{mode_change_limit}'
 			group_info['monitor_flag'] = 0
-			return await cqbot.send_group_msg(group_id = group_id, self_id = group_info['bot_qqid'], message = msg)
+			group_info['execute_flag'] = False
+			if group_id in event_cache: return await cqbot.send(event_cache[group_id], msg)
+			else: return await cqbot.send_group_msg(group_id = int(group_id), self_id = group_info['bot_qqid'], message = msg)
 
 		#判断各BOSS圈数并获取预约表推送
 		boss_num = 0
@@ -315,14 +340,17 @@ async def monitor_task(group_id):
 			lap_num = boss_info['lap_num']
 			max_hp = boss_info['max_hp']
 			current_hp = boss_info['current_hp']
-			boss_hp_msg.append(f'{boss_num+1}王：{current_hp}/{max_hp}({current_hp/max_hp}%)')
+			hp_percent = '{:.2f}'.format(current_hp/max_hp*100)
+			boss_hp_msg.append(f'{lap_num}周目{boss_num+1}王：{current_hp}/{max_hp}({hp_percent}%)')
 			if lap_num != group_info['boss_status'][boss_num]:
 				group_info['boss_status'][boss_num] = lap_num
 				push_list = group_info['pre_push'][boss_num]
 				if len(push_list) > 0:     #预约后群内和行会内提醒
+					at_msg = []
 					for qqid in push_list:
-						at_msg = f'提醒：已到{lap_num}周目 {boss_num+1} 王！请注意沟通上一尾刀~\n[CQ:at,qq={qqid}]'
-						await cqbot.send_group_msg(group_id = group_id, self_id = group_info['bot_qqid'], message = at_msg)
+						at_msg.append(f'提醒：已到{lap_num}周目 {boss_num+1} 王！\n[CQ:at,qq={qqid}]')
+					if group_id in event_cache: await cqbot.send(event_cache[group_id], '\n'.join(at_msg))
+					else: await cqbot.send_group_msg(group_id = int(group_id), self_id = group_info['bot_qqid'], message = at_msg)
 					group_info['pre_push'][boss_num] = []
 			boss_num += 1
 
@@ -341,6 +369,7 @@ async def monitor_task(group_id):
 		clan_battle_id = clan_battle_info['clan_battle_id']
 		in_battle = []
 		for hst in history:
+			# logger.info(f"history_id = {hst['history_id']}, arrow = {group_info['arrow']}")
 			if ((group_info['arrow'] != 0) and (int(hst['history_id']) > int(group_info['arrow']))) or (group_info['arrow'] == 0):   #记录刀ID防止重复
 				name = hst['name']					#名字
 				vid = hst['viewer_id']				#13位ID
@@ -370,8 +399,7 @@ async def monitor_task(group_id):
 					if lap >= int(st): phases = st
 				phases = phase[phases]
 				timeline = await query.query(account_info, '/clan_battle/battle_log_list', {'clan_battle_id': clan_battle_id, 'order_num': boss, 'phases': [phases], 'report_types': [1], 'hide_same_units': 0, 'favorite_ids': [], 'sort_type': 3, 'page': 1})
-				try: timeline_list = timeline['battle_list']
-				except: return
+				timeline_list = timeline['battle_list']
 				start_time, used_time = 0, 0
 				for tl in timeline_list:
 					if tl['battle_end_time'] == ctime:
@@ -403,13 +431,12 @@ async def monitor_task(group_id):
 				'lap_num': group_info['boss_status'][num],
 				'order_num': num+1
 			})
-			try: group_info['fighter_num'] = boss_info2['fighter_num']
-			except: return
-			if group_info['in_game'][num] != group_info['fighter_num']:
-				if group_info['fighter_num'] > group_info['in_game'][num]:
-					diff = group_info['fighter_num'] - group_info['in_game'][num]
+			fighter_num = boss_info2['fighter_num']
+			if group_info['in_game'][num] != fighter_num:
+				if fighter_num > group_info['in_game'][num]:
+					diff = fighter_num - group_info['in_game'][num]
 					group_info['in_game_old'][num] += diff
-				group_info['in_game'][num] = group_info['fighter_num']
+				group_info['in_game'][num] = fighter_num
 				change = True
 			if in_battle != []:
 				change = True
@@ -419,22 +446,31 @@ async def monitor_task(group_id):
 					if ib[1] == 1:
 						group_info['in_game_old'][ib[0]-1] = 0
 
+		push_hp = True
 		if change == True:
 			group_info['renew_coin'] = 15
 			if group_info['in_game_calc_mode'] == 1:
 				msg.append(f"当前实战人数发生变化:\n[{group_info['in_game_old'][0]}][{group_info['in_game_old'][1]}][{group_info['in_game_old'][2]}][{group_info['in_game_old'][3]}][{group_info['in_game_old'][4]}]")
 			else:
 				msg.append(f"当前90s内实战人数发生变化:\n[{group_info['in_game'][0]}][{group_info['in_game'][1]}][{group_info['in_game'][2]}][{group_info['in_game'][3]}][{group_info['in_game'][4]}]")
+			if len(msg) == 1: push_hp = False
 
-		if msg != '':
+		if len(msg) != 0:
 			msg = '\n'.join(msg)
 			if len(msg) > 200: msg = '...\n' + msg[-200:]
-			boss_hp_msg = '\n'.join(boss_hp_msg)
-			back_msg = f'{msg}\n{boss_hp_msg}'
-			await cqbot.send_group_msg(group_id = group_id, self_id = group_info['bot_qqid'], message = back_msg)
+			if push_hp:
+				boss_hp_msg = '\n'.join(boss_hp_msg)
+				back_msg = f'{msg}\n{boss_hp_msg}'
+			else:
+				back_msg = msg
+			if group_id in event_cache: await cqbot.send(event_cache[group_id], back_msg)
+			else: await cqbot.send_group_msg(group_id = int(group_id), self_id = group_info['bot_qqid'], message = back_msg)
 	except Exception as e:
 		group_info['monitor_flag'] = 0
-		await cqbot.send_group_msg(group_id = group_id, self_id = group_info['bot_qqid'], message = f'监控出现错误，已取消监控：{str(e)}')
+		back_msg = f'监控出现错误，已取消监控：{str(e)}'
+		if group_id in event_cache: await cqbot.send(event_cache[group_id], back_msg)
+		else: await cqbot.send_group_msg(group_id = int(group_id), self_id = group_info['bot_qqid'], message = back_msg)
+	group_info['execute_flag'] = False
 
 
 @sv.on_rex(r'^(切换|开启|打开|关闭)(?:会战|自动报刀)(?:推送|监控)?')
@@ -449,6 +485,7 @@ async def switch_monitor(bot:HoshinoBot, ev:CQEvent):
 	elif text and text == '关闭': flag = 0
 
 	group_id = ev.group_id
+	event_cache[str(group_id)] = ev
 	group_info = secret.get_sec(group_id)
 
 	if flag > -1:
@@ -463,6 +500,16 @@ async def switch_monitor(bot:HoshinoBot, ev:CQEvent):
 			await bot.send(ev, '已关闭会战推送')
 
 
+@sv.on_fullmatch('更新账号数据')
+async def update_account(bot:HoshinoBot, ev:CQEvent):
+	infos = secret.get_group_infos()
+	for _, group_info in infos.items():
+		account_list = group_info["account_list"]
+		for _, account_info in account_list.items():
+			account_info["num"] = get_new_account_number(account_list)
+	await bot.send(ev, '更新成功')
+
+
 @sv.on_fullmatch('出刀监控状态','报刀监控状态')
 async def monitor_statu(bot:HoshinoBot, ev:CQEvent):
 	group_id = ev.group_id
@@ -470,17 +517,20 @@ async def monitor_statu(bot:HoshinoBot, ev:CQEvent):
 	if not group_info: return await bot.send(ev, '当前群未绑定任何账号')
 	account_list:Dict = group_info["account_list"]
 	msg = ['当前群绑定的报刀账号有：']
-	for account, account_info in account_list.items():
+	for _, account_info in account_list.items():
 		status = account_info["status"]
-		text = f'---账号：{account}，状态：{"已激活" if status == "1" else "未激活"}'
+		text = f'---编号{account_info["num"]}，状态：{"已激活" if status == "1" else "未激活"}'
 		if status == "1" and "pcrname" in account_info:
 			text += f'，游戏名：{account_info["pcrname"]}'
 		msg.append(text)
 	if len(msg) == 1: return await bot.send(ev, '当前群未绑定任何账号，无任何状态')
-	msg.append(f'当前监控的账号：{group_info["now_monitor_account"]}')
+	account = group_info["now_monitor_account"]
+	account_name = account_list[account]["pcrname"]
+	account_num = account_list[account]["num"]
+	msg.append(f'当前监控的账号编号：{account_num}，游戏名：{account_name}')
 	msg.append(f'是否开启监控：{"已开启" if group_info["monitor_flag"] else "未开启"}')
-	msg.append('已激活状态下的账号可以通过切换账号来切换出刀监控')
-	msg.append('输入 删除监控账号+账号 可以删除绑定的账号')
+	msg.append('已激活状态下的账号可以通过 切换账号 来切换出刀监控')
+	msg.append('输入 删除监控账号 + 账号编号 可以删除绑定的账号')
 	await bot.send(ev, '\n'.join(msg))
 
 
@@ -492,26 +542,65 @@ async def delete_account(bot:HoshinoBot, ev:CQEvent):
 	group_info = secret.get_sec(group_id)
 	if not group_info: return await bot.send(ev, '当前群未绑定任何账号')
 	account_list:Dict = group_info["account_list"]
-	account = match.group(1)
-	if account not in account_list: return await bot.send(ev, '当前群未绑定该账号')
-	msg = ['删除成功']
-	account_list.pop(account)
-	if account == group_info['now_monitor_account']:
-		group_info['now_monitor_account'] = ''
-		group_info['monitor_flag'] = 0
-		msg.append('删除的账号是当前正在监控的账号，已自动退出出刀监控')
-	await bot.send(ev, '\n'.join(msg))
+	num = int(match.group(1))
+	for account, account_info in account_list.items():
+		if num == account_info['num']:
+			msg = ['删除成功']
+			account_list.pop(account)
+			if account == group_info['now_monitor_account']:
+				group_info['now_monitor_account'] = ''
+				group_info['monitor_flag'] = 0
+				msg.append('删除的账号是当前正在监控的账号，已自动退出出刀监控')
+			return await bot.send(ev, '\n'.join(msg))
+	await bot.send(ev, '不存在的编号')
+
+
+@sv.on_rex(r'^切换账号(?: |)([\s\S]*)')
+async def switch_account(bot:HoshinoBot, ev:CQEvent):
+	match = ev['match']
+	if not match : return
+	if not priv.check_priv(ev, priv.ADMIN): return await bot.send(ev,'权限不足，当前指令仅管理员可用!')
+
+	await verify(bot, ev)
+	group_id = ev.group_id
+	group_info = secret.get_sec(group_id)
+	account_list = group_info['account_list']
+	num = int(match.group(1))
+	account_info = None
+	account = 0
+	for account_, account_info_ in account_list.items():
+		if num == account_info_['num']:
+			account_info = account_info_
+			account = account_
+			break
+	if not account_info:
+		return await bot.send(ev, "该账号不存在，请先加机器人好友私聊发 `clan 群号 pcr账号 密码` 以绑定账号")
+	if account_info["status"] != '1':
+		return await bot.send(ev, "该账号未验证通过，请先加机器人好友私聊发 `clan 群号 pcr账号 密码` 重新绑定并验证")
+	if group_info['now_monitor_account'] == account:
+		return await bot.send(ev, "当前正在监控这个账号，不需要切换")
+	group_info['now_monitor_account'] = account
+
+	try:
+		await verify(bot, ev, True)
+		group_info['tvid'] = await query.get_pcrid(account_info)
+		group_info['coin'] = await query.get_item_stock(account_info, 90006)
+		await bot.send(ev, f'切换成功，当前监控的账号为 {account_info["pcrname"]}')
+	except Exception as e:
+		await bot.send(ev, f'切换失败，请重试:\n{str(e)}')
 
 
 @sv.on_fullmatch('初始化会战推送','初始化会战监控','初始化自动报刀')
 async def init_monitor(bot:HoshinoBot, ev:CQEvent):
 	group_id = ev.group_id
-	output_path = current_folder + "/output" + f'/{group_id}.txt'
-	if exists(output_path): os.remove(output_path)
+	group_info = secret.get_sec(group_id)
+	group_info['arrow'] = 0
+	output_file = current_folder + "/output" + f'/{group_id}.txt'
+	if exists(output_file): os.remove(output_file)
 	await bot.send(ev, '初始化成功')
 
 
-@sv.on_rex(r'^(会战|取消)预约([1-5])$')
+@sv.on_rex(r'^(会战|取消|)预约([1-5])$')
 async def preload(bot:HoshinoBot, ev:CQEvent):
 	match = ev['match']
 	if not match : return
@@ -553,13 +642,14 @@ async def preload_list(bot:HoshinoBot, ev:CQEvent):
 	msg = []
 	for pre_lists in group_info['pre_push']:
 		boss_num += 1
-		msg += f'{boss_num}王预约列表\n'
+		msg.append(f'{boss_num}王预约列表:\n')
 		for qqid in pre_lists:
 			try:
 				info = await bot.get_group_member_info(group_id=group_id, user_id=qqid)
 				name = info['card'] or qqid
 			except Exception as e: await bot.send(ev, f'出现错误:\n{str(e)}')
-			msg.append(f'+{name}')
+			msg.append(f'++{name}')
+		msg.append('\n')
 	await bot.send(ev, '\n'.join(msg))
 
 
@@ -579,35 +669,6 @@ async def help(bot:HoshinoBot, ev:CQEvent):
 	await bot.send(ev, help_msg)
 
 
-@sv.on_rex(r'^切换账号(?: |)([\s\S]*)')
-async def switch_account(bot:HoshinoBot, ev:CQEvent):
-	match = ev['match']
-	if not match : return
-	if not priv.check_priv(ev, priv.ADMIN): return await bot.send(ev,'权限不足，当前指令仅管理员可用!')
-
-	await verify(bot, ev)
-	group_id = ev.group_id
-	group_info = secret.get_sec(group_id)
-	account_list = group_info['account_list']
-	account = match.group(1)
-	if account not in account_list:
-		return await bot.send(ev, "该账号未绑定，请先加机器人好友私聊发 `clan 群号 pcr账号 密码` 以绑定账号")
-	account_info = account_list[account]
-	if account_info["status"] != '1':
-		return await bot.send(ev, "该账号未验证通过，请先加机器人好友私聊发 `clan 群号 pcr账号 密码` 重新绑定并验证")
-	if group_info['now_monitor_account'] == account:
-		return await bot.send(ev, "当前正在监控这个账号，不需要切换")
-	group_info['now_monitor_account'] = account
-
-	try:
-		await verify(bot, ev, True)
-		group_info['tvid'] = await query.get_pcrid(account_info)
-		group_info['coin'] = await query.get_item_stock(account_info, 90006)
-		await bot.send(ev, f'切换成功，当前监控的账号为 {account_info["pcrname"]}')
-	except Exception as e:
-		await bot.send(ev, f'切换失败，请重试:\n{str(e)}')
-
-
 def rounded_rectangle(size, radius, color):     #ChatGPT帮我写的，我也不会
 	width, height = size
 	rectangle = Image.new("RGBA", size, color)
@@ -622,8 +683,16 @@ def rounded_rectangle(size, radius, color):     #ChatGPT帮我写的，我也不
 	rectangle.paste(corner.rotate(180), (width - radius, height - radius))
 	rectangle.paste(corner.rotate(270), (width - radius, 0))
 	return rectangle
-def format_number_with_commas(number):      #这个也是他帮我写的
-	return '{:,}'.format(number)
+
+
+@sv.on_rex(r'^切换(文字|图片)模式$')
+async def switch_status_mode(bot:HoshinoBot, ev:CQEvent):
+	match = ev['match']
+	if not match : return
+	group_id = ev.group_id
+	group_info = secret.get_sec(group_id)
+	group_info['text_mode'] = match.group(1) == '文字' and 1 or 0
+	await bot.send(ev,'切换成功')
 
 
 @sv.on_prefix('会战状态', '状态')    #这个更是重量级
@@ -638,65 +707,82 @@ async def status(bot:HoshinoBot, ev:CQEvent):
 
 	status = ev.message.extract_plain_text().strip()
 	if group_info['monitor_flag'] == 0 and status != '1':
-		return await bot.send(ev,'现在会战推送状态为关闭，请确认是否有人上号，如果仍然需要查看状态，请输入 会战状态1 来确认')
+		return await bot.send(ev,'现在会战推送状态为关闭，请确认是否有人上号，如果仍然需要查看状态，请输入 会战状态1 来确认\n（使用 会战状态1 查看状态的话，实战人数不正确）')
 
-	load_index = await query.get_load_index(account_info)
-	clan_info = await query.get_clan_info(account_info)
-	clan_id = clan_info['clan']['detail']['clan_id']
-	battle_info = await query.get_clan_battle_info(account_info, clan_id, group_info['coin'])
-
-	#try:
-	if group_info['text_mode'] == 1:
-		msg = ''
+	try:
+		clan_info = await query.get_clan_info(account_info)
+		clan_id = clan_info['clan']['detail']['clan_id']
+		battle_info = await query.get_clan_battle_info(account_info, clan_id)
 		clan_battle_id = battle_info['clan_battle_id']
-		clan_name = battle_info['user_clan']['clan_name']
-		rank = battle_info['period_rank']
-		lap = battle_info['lap_num']
-		msg += f'{clan_name}[{rank}名]--{lap}周目\n※实战人数指90秒内人数\n'
-		for boss in battle_info['boss_info']:
-			boss_num = boss['order_num']
-			boss_lap_num = boss['lap_num']
-			mhp = boss['max_hp']
-			hp = boss['current_hp']
-			hp_percentage = int((hp / mhp)*100)  # 计算血量百分比
-			boss_info2 = await query.query(account_info, '/clan_battle/boss_info', {
-				'clan_id': clan_id,
-				'clan_battle_id': clan_battle_id,
-				'lap_num': boss_lap_num,
-				'order_num': boss_num
-			})
-			fighter_num = boss_info2['fighter_num']
-			msg += f'{boss_lap_num}周目{boss_num}王 剩余{hp}血({hp_percentage}%)|{fighter_num}人实战\n'
-		await bot.send(ev,msg)
-	else:
 
-		#第一部分
-		for root_, dirs_, files_ in os.walk(img_folder+'/bg'):	#自定义背景图
-			bg = files_
-		bg_num = random.randint(0, len(bg)-1)
-		img = Image.open(img_folder+'/bg/'+bg[bg_num])
-		img = img.resize((1920,1080),Image.ANTIALIAS)
-		# ids = list(_pcr_data.CHARA_NAME.keys())					#随机pcr卡面背景图（个人专用，因为改了hoshino的接口）
-		# role_id = random.choice(ids)
-		# while chara.is_npc(role_id): role_id = random.choice(ids)
-		# star = random.choice([3,6])
-		# c = chara.fromid(role_id, star)
-		# img:Image.Image = c.card.open()
-		# img = img.resize((1920,1080),Image.ANTIALIAS)
+		if group_info['text_mode'] == 1:
+			msg = ''
+			clan_name = battle_info['user_clan']['clan_name']
+			rank = battle_info['period_rank']
+			lap = battle_info['lap_num']
+			msg += f'{clan_name}[{rank}名]--{lap}周目\n※实战人数指90秒内人数\n'
+			for boss in battle_info['boss_info']:
+				boss_num = boss['order_num']
+				boss_lap_num = boss['lap_num']
+				mhp = boss['max_hp']
+				hp = boss['current_hp']
+				hp_percentage = int((hp / mhp)*100)  # 计算血量百分比
+				boss_info = await query.query(account_info, '/clan_battle/boss_info', {
+					'clan_id': clan_id,
+					'clan_battle_id': clan_battle_id,
+					'lap_num': boss_lap_num,
+					'order_num': boss_num
+				})
+				fighter_num = boss_info['fighter_num']
+				msg += f'{boss_lap_num}周目{boss_num}王 剩余{hp}血({hp_percentage}%)|{fighter_num}人实战\n'
+			return await bot.send(ev,msg)
 
-		front_img = Image.open(img_folder+'/cbt.png')
-		img.paste(front_img, (0,0),front_img)
+
+		# for root_, dirs_, files_ in os.walk(img_folder+'/bg'):	#自定义背景图
+		#     bg = files_
+		# bg_num = random.randint(0, len(bg)-1)
+		# img = Image.open(img_folder+'/bg/'+bg[bg_num])
+		# img = img.resize((1920,1080),Image.Resampling.LANCZOS)
+		ids = list(_pcr_data.CHARA_NAME.keys())					#随机pcr卡面背景图（个人专用，因为改了hoshino的接口）
+		role_id = random.choice(ids)
+		while chara.is_npc(role_id): role_id = random.choice(ids)
+		star = random.choice([3,6])
+		c = chara.fromid(role_id, star)
+		img:Image.Image = c.card.open()
+
+		img = img.convert('RGBA')
+		img = img.resize((1920,1080), Image.Resampling.LANCZOS)
+
+		# front_img = Image.open(img_folder+'/cbt.png')
+		# img.paste(front_img, (0,0),front_img)
 		draw = ImageDraw.Draw(img)
-		setFont = ImageFont.truetype(font_file, 40)
+		setFont_60 = ImageFont.truetype(font_file, 60)
+		setFont_40 = ImageFont.truetype(font_file, 40)
+		setFont_25 = ImageFont.truetype(font_file, 25)
+		setFont_24 = ImageFont.truetype(font_file, 24)
+		setFont_15 = ImageFont.truetype(font_file, 15)
 
-		clan_battle_id = battle_info['clan_battle_id']
-		clan_name = battle_info['user_clan']['clan_name']
-		draw.text((1340,50), f'{clan_name}', font=setFont, fill="#A020F0")
-		rank = battle_info['period_rank']
-		setFont = ImageFont.truetype(font_file, 25)
-		draw.text((1340,170), f'排名：{rank}', font=setFont, fill="#A020F0")
+		radius = 10 #圆角半径
+		mask = Image.new("RGBA", img.size, (0, 0, 0, 0)) # 创建一个透明蒙版图像
+		mask_draw = ImageDraw.Draw(mask)
+		# rectangle_color = dominant_colors[0][0] + (100,)
+		rectangle_color = (255, 255, 255, 100)  # 半透明白色
+		for offset in range(5): #boss信息底框
+			rectangle_coords = (70, 33 + offset * 145, 1275, 142 + offset * 145)
+			mask_draw.rounded_rectangle(rectangle_coords, radius = radius, fill = rectangle_color)
+		mask_draw.rounded_rectangle((70, 745, 1275, 1060), radius = radius, fill = rectangle_color) #玩家信息底框
+		mask_draw.rounded_rectangle((1305, 35, 1840, 370), radius = radius, fill = rectangle_color) #公会信息底框
+		mask_draw.rounded_rectangle((1305, 390, 1840, 720), radius = radius, fill = rectangle_color) #出刀信息底框
+		mask_draw.rounded_rectangle((1305, 745, 1840, 1060), radius = radius, fill = rectangle_color) #留言板底框
+		blurred_mask = mask.filter(ImageFilter.GaussianBlur(5))	#给画好的底框添加模糊效果
+		img.paste(blurred_mask, (0, 0), blurred_mask)
+		
+		name_length = draw.textlength(c.name, font=setFont_15)
+		draw.text((img.size[0] - name_length-10, img.size[1]-25), c.name, font=setFont_15, fill="#000000") #背景图角色名
+
+		#boss信息部分
 		lap = battle_info['lap_num']
-		img_num = 0
+		bg = Image.new('RGBA', (335, 35), (0, 0, 0, 128)) #boss血量半透明黑色背景
 		for boss in battle_info['boss_info']:
 			boss_num = boss['order_num']
 			boss_lap_num = boss['lap_num']
@@ -705,40 +791,37 @@ async def status(bot:HoshinoBot, ev:CQEvent):
 			hp_percentage = hp / mhp  # 计算血量百分比
 
 			# 根据血量百分比设置血条颜色
-			if hp_percentage > 0.5: hp_color = "lightgreen"
-			elif 0.25 < hp_percentage <= 0.5: hp_color = "orange"
-			else: hp_color = "red"
+			opacity = 200
+			if hp_percentage > 0.5: hp_color = (144,238,144,opacity)
+			elif 0.25 < hp_percentage <= 0.5: hp_color = (255,165,0,opacity)
+			else: hp_color = (255,0,0,opacity)
+			if boss_lap_num - lap == 2: hp_color = (160,32,240,opacity)
+			elif boss_lap_num - lap == 1: hp_color = (255,192,203,opacity)
 
-			if boss_lap_num - lap == 2: hp_color = "purple"
-			elif boss_lap_num - lap == 1: hp_color = "pink"
-
-			length = int((hp / mhp) * 1180)
+			point = 50+(boss_num-1)*145
+			length = int((hp / mhp) * 1185)
+			# (70, 35 + offset * 145, 1275, 140 + offset * 145)
 			hp_bar = rounded_rectangle((length, 95), 10, hp_color)
-			img.paste(hp_bar, (80, 40 + (boss_num - 1) * 142), hp_bar)
+			img.paste(hp_bar, (80, 40 + (boss_num - 1) * 145), hp_bar)
 			try:
-				boss_portrait = Image.open(current_folder+'/img'+f'/{boss_icon_list[img_num]}.png')
+				boss_portrait = Image.open(current_folder+'/img'+f'/{boss_icon_list[boss_num - 1]}.png')
 			except:
 				boss_portrait = R.img(f'priconne/unit/icon_unit_100131.png').open()
-			img_num += 1
-			boss_portrait = boss_portrait.resize((64,64),Image.ANTIALIAS)
-			img.paste(boss_portrait, (93, 50+(boss_num-1)*142))
+			boss_portrait = boss_portrait.resize((70,70),Image.Resampling.LANCZOS)
+			img.paste(boss_portrait, (93, point + 2))
 
-
-			# 在BOSS血条循环中
-			bg_color = (0, 0, 0, 128)  # 半透明黑色背景
-			bg_width = 300  # 背景宽度
-			bg_height = 35  # 背景高度
-
-			# 绘制半透明背景
-			bg = Image.new('RGBA', (bg_width, bg_height), bg_color)
-			img.paste(bg, (160, 38+(boss_num-1)*142), bg)
-			bg_width = 200
-			stage_color = {
+			# boss血量和周目数
+			img.paste(bg, (170, point), bg) #boss血量半透明黑色背景
+			# draw.rounded_rectangle((165, point, 480, point + 35), radius = 5, fill = (0, 0, 0, 128)) #boss血量半透明黑色背景
+			hp_text = f'{"{:,}".format(hp)}/{"{:,}".format(mhp)}'
+			hp_text_length = draw.textlength(hp_text, font=setFont_25)
+			draw.text((330 - hp_text_length / 2, point + 2), hp_text, font=setFont_25, fill="#FFFFFF") #血量
+			stage_color = { #根据阶段不同修改背景颜色
 				1: '#83C266',
 				4: '#67A3E5',
 				11: '#D56CB9',
 				31: '#CF4F45',
-				41: '#A465CC'
+				39: '#A465CC'
 			}
 			for st in side:
 				if boss_lap_num >= int(st): cur_stage = st
@@ -746,48 +829,44 @@ async def status(bot:HoshinoBot, ev:CQEvent):
 			for st in stage_color:
 				if boss_lap_num >= st: bg_color = st
 			bg_color = stage_color[bg_color]
-			bg = Image.new('RGBA', (bg_width, bg_height), bg_color)
-			img.paste(bg, (500, 38+(boss_num-1)*142), bg)
-			setFont = ImageFont.truetype(font_file, 25)
-			draw.text((160, 40+(boss_num-1)*142), f'{format_number_with_commas(hp)}/{format_number_with_commas(mhp)}', font=setFont, fill="#FFFFFF")
-			draw.text((500, 40+(boss_num-1)*142), f'{cur_stage}面 {boss_lap_num}周目', font=setFont, fill="#FFFFFF")
+			draw.rounded_rectangle((530, point, 685, point + 35), radius = radius, fill = bg_color) #周目数纯色背景
+			draw.text((540, point+2), f'{cur_stage}面 {boss_lap_num}周目', font=setFont_25, fill="#FFFFFF") #周目数
+
+			if group_info['monitor_flag'] == 0: in_game_30, in_game_total = 0, 0
+			else: in_game_30, in_game_total = {group_info['in_game'][boss_num-1]}, {group_info['in_game_old'][boss_num-1]}
+			draw.rounded_rectangle((705, point, 905, point + 35), radius = radius, fill = bg_color) #实战人数纯色背景
+			draw.text((715, point+2), f'实战人数: {in_game_30} ({in_game_total})', font=setFont_25, fill="#FFFFFF") #实战人数
 
 			pre = group_info['pre_push'][boss_num-1]
-			all_name = ''
+			all_name = []
 			if pre != []:
 				for qqid in pre:
-					name = ''
 					try:
 						info = await bot.get_stranger_info(self_id=ev.self_id, user_id=qqid)
-						name = info['nickname'] or qqid
-						name = util.filt_message(name)
-						all_name += f'{name} '
-					except Exception as e: logger.error(f'{str(e)}')
-			if all_name != '':
-				all_name+='已预约'
-				draw.text((160, 80+(boss_num-1)*142), f'{all_name}', font=setFont, fill="#A020F0")
-			else: draw.text((160, 80+(boss_num-1)*142), f'无人预约', font=setFont, fill="#A020F0")
+						all_name.append(info['nickname'] or qqid)
+					except Exception as e: logger.error(str(e))
+			if len(all_name) != 0: draw.text((175, point + 42), f'{"、".join(all_name)}已预约', font=setFont_25, fill="#A020F0")
+			else: draw.text((175, point + 42), f'无人预约', font=setFont_25, fill="#A020F0")
 
-		#第二部分
+		#玩家信息部分
 		row = 0
 		width = 0
-		setFont = ImageFont.truetype(font_file, 20)
-		last_rank = clan_info['last_total_ranking']
-		draw.text((1320, 320), f'上期排名:{last_rank}', font=setFont, fill="#A020F0")
 		all_battle_count = 0
+		damage_rank = []
 		for members in clan_info['clan']['members']:
 			vid = members['viewer_id']
 			name = members['name']
 			favor = members['favorite_unit']
 			favor_id = str(favor['id'])[:-2]
 			stars = 3 if members['favorite_unit']['unit_rarity'] != 6 else 6
+			damage_rank.append({"name":name,"damage":0})#random.randint(10000000,120000000)
 			try:
 				role = chara.fromid(favor_id, stars)
 				icon = await role.get_icon()
-				icon = icon.open()
-				icon = icon.resize((48,48),Image.ANTIALIAS)
+				icon:Image.Image = icon.open()
+				icon = icon.resize((48,48),Image.Resampling.LANCZOS)
 				img.paste(icon, (82+int(149.5*width), 761+int(59.8*row)), icon)
-			except Exception as e: logger.error(f'{str(e)}')
+			except Exception as e: logger.error(str(e))
 
 			kill_acc = 0
 			today_t = time.localtime()
@@ -798,9 +877,6 @@ async def status(bot:HoshinoBot, ev:CQEvent):
 			else:
 				today = today_t[2]
 
-			#today = 26
-			setFont = ImageFont.truetype(font_file, 15)
-			draw.text((1000,760), f'{today}日', font=setFont, fill="#A020F0")
 			img3 = Image.new('RGB', (25, 17), "white")
 			img4 = Image.new('RGB', (12, 17), "red")
 			time_sign = 0
@@ -816,13 +892,12 @@ async def status(bot:HoshinoBot, ev:CQEvent):
 						re_vid = int(line[2])
 						day = int(line[3])
 						hour = int(line[4])
-					else:#re_battle_id = int(line[4]);re_name = line[5];re_dmg = int(line[9]);re_boss_id = int(line[11]);re_is_auto = int(line[13])
+					else:#re_battle_id = int(line[4]);re_name = line[5];re_dmg = int(line[9]);re_boss_id = int(line[11]);re_is_auto = int(line[13]);re_lap = int(line[7]);re_boss = int(line[8]);
 						mode = 2
 						day = int(line[0])
 						hour = int(line[1])
 						re_vid = line[6]
-						re_lap = int(line[7])
-						re_boss = int(line[8])
+						re_dmg = int(line[9])
 						re_kill = int(line[10])
 						re_clan_battle_id = int(line[12])
 						re_start_time = int(line[14])
@@ -833,7 +908,7 @@ async def status(bot:HoshinoBot, ev:CQEvent):
 					if if_today == True and mode == 1 and int(vid) == int(re_vid): sl_sign = 1
 
 					if int(vid) == int(re_vid) and if_today == True and mode == 2:
-						full_check = 0
+						damage_rank[-1]["damage"] += re_dmg
 						if re_start_time == 90 and re_kill == 1:
 							if time_sign >= 1:
 								time_sign -= 1
@@ -841,17 +916,6 @@ async def status(bot:HoshinoBot, ev:CQEvent):
 								kill_acc += 0.5
 								continue
 							if re_battle_time <= 20 and re_battle_time != 0: time_sign += 1
-							dmg_check = 0
-							output_file = os.path.join(current_folder, 'output', f'{group_id}.txt')
-							if not exists(output_file):open(output_file, 'w')
-							for check in open(output_file, encoding='utf-8'):
-								if check != '':
-									check = check.split(',')
-									if check[0] != 'SL' and (check[7] == re_lap and check[8] == re_boss): dmg_check += check[9]
-							for st in phase:
-								if re_lap >= int(st): phases = st
-							phases = phase[phases]
-							if dmg_check > health_list[phases-1][re_boss-1]: full_check += 1	#总伤害大于BOSS血量，判定为满补
 							kill_acc += 0.5
 							half_sign += 0.5
 						elif re_start_time == 90 and re_kill == 0:
@@ -868,9 +932,9 @@ async def status(bot:HoshinoBot, ev:CQEvent):
 				kill_acc = 3
 			all_battle_count += kill_acc
 
-			if kill_acc == 0: draw.text((132+149*width, 761+60*row), f'{name}', font=setFont, fill="#FF0000")
-			elif 0< kill_acc < 3: draw.text((132+149*width, 761+60*row), f'{name}', font=setFont, fill="#FF00FF")
-			elif kill_acc == 3: draw.text((132+149*width, 761+60*row), f'{name}', font=setFont, fill="#FFFF00")
+			if kill_acc == 0: draw.text((132+149*width, 761+60*row), f'{name}', font=setFont_15, fill="#FF0000")		#未出刀
+			elif 0< kill_acc < 3: draw.text((132+149*width, 761+60*row), f'{name}', font=setFont_15, fill="#FF00FF")	#已出刀未出完
+			elif kill_acc == 3: draw.text((132+149*width, 761+60*row), f'{name}', font=setFont_15, fill="#FFFF00")		#出完刀
 			width2 = 0
 			kill_acc = kill_acc - half_sign
 
@@ -882,18 +946,38 @@ async def status(bot:HoshinoBot, ev:CQEvent):
 				img.paste(img4, (130+int(149.5*width)+30*width2, 785+60*row))
 				half_sign -= 0.5
 				width2 += 1
-			if sl_sign == 1: draw.text((130+int(149.5*width), 785+60*row), f'SL', font=setFont, fill="black")
+			if sl_sign == 1: draw.text((130+int(149.5*width), 785+60*row), f'SL', font=setFont_15, fill="black")
 			width += 1
 			if width == 6:
 				width = 0
 				row += 1
-		count_m = len(clan_info['clan']['members'])*3
-		draw.text((1000,780), f'今日已出{all_battle_count}刀/{count_m}刀', font=setFont, fill="#A020F0")
+		damage_rank.sort(key=lambda x: x["damage"])
+		draw.text((1000,760), '今日伤害排名：', font=setFont_15, fill="#A020F0")
+		rank = 1
+		for player_damage in damage_rank:
+			draw.text((1000, 760 + 25 * rank), f'{rank} : {player_damage["damage"]}, {player_damage["name"]}', font=setFont_15, fill="#A020F0")
+			rank += 1
+			if rank > 10 :break
 
-		#第三部分
-		info = battle_info['boss_info'] #BOSS
-		next_lap_1 = battle_info['lap_num']    #周目
-		msg = ''
+		#公会信息部分
+		clan_name = battle_info['user_clan']['clan_name']
+		clan_name_length = draw.textlength(clan_name, font=setFont_40)
+		draw.text((1570 - int(clan_name_length / 2), 50), clan_name, font=setFont_40, fill="#A020F0") #公会名
+		rank_text = f'当期排名：{battle_info["period_rank"]}   上期排名:{clan_info["last_total_ranking"]}'
+		rank_length = draw.textlength(rank_text, font=setFont_25)
+		draw.text((1570 - int(rank_length / 2), 110), rank_text, font=setFont_25, fill="#A020F0") #公会排名
+		progress_color = all_battle_count >= 90 and '#ADFF2F' or (#绿
+			all_battle_count >= 60 and '#EEEE00' or (#黄
+				all_battle_count >= 30 and '#FFA500' or '#EE6363'))#橙，红
+		offset = 32
+		draw.line([(1620+offset, 210), (1525+offset, 345)], fill=progress_color, width=7)
+		count_m = len(clan_info['clan']['members'])*3
+		draw.text((1363+offset, 215), '今日已出', font=setFont_25, fill="#A020F0")
+		draw.text((1688+offset, 305), '刀', font=setFont_25, fill="#A020F0")
+		draw.text((1515+offset - draw.textlength(f'{all_battle_count}', font=setFont_60)/2, 205), f'{all_battle_count}', font=setFont_60, fill=progress_color)
+		draw.text((1635+offset - draw.textlength(f'{count_m}', font=setFont_60)/2, 275), f'{count_m}', font=setFont_60, fill=progress_color)
+
+		#出刀信息部分
 		history = battle_info['damage_history']
 		order = 0
 		for hst in history:
@@ -913,14 +997,17 @@ async def status(bot:HoshinoBot, ev:CQEvent):
 				if_kill = ''
 				if kill == 1: if_kill = '并击破'
 				msg = f'[{day}日{hour:02}:{minute:02}]{name} 对 {lap} 周目 {boss} 王造成了 {damage} 伤害{if_kill}'
-				if kill == 1: draw.text((1320, 385+(order*15)), f'{msg}', font=setFont, fill="black")
-				else: draw.text((1320, 385+(order*15)), f'{msg}', font=setFont, fill="purple")
+				if kill == 1: draw.text((1320, 385+(order*15)), f'{msg}', font=setFont_15, fill="black")
+				else: draw.text((1320, 385+(order*15)), f'{msg}', font=setFont_15, fill="purple")
 
 		#留言部分
+		tital_length = draw.textlength('留言板', font=setFont_40)
+		draw.text((1570 - int(tital_length / 2), 750), '留言板', font=setFont_40, fill="#A020F0") #公会名
 		if group_id not in chat_list:
-			draw.text((1380,761), f'本群暂时没有留言！', font=setFont, fill="#A020F0")
+			text_length = draw.textlength('本群暂时没有留言！', font=setFont_24)
+			draw.text((1570 - int(text_length / 2), 850), f'本群暂时没有留言！', font=setFont_24, fill="#A020F0")
 		else:
-			msg = '留言板：\n'
+			msg_list = []
 			for i in range(0,len(chat_list[group_id]["uid"])):
 				time_now = int(time.time())
 				time_diff = time_now - chat_list[group_id]["time"][i]
@@ -935,33 +1022,19 @@ async def status(bot:HoshinoBot, ev:CQEvent):
 					nickname = nickname['nickname']
 				except: pass
 				chat = chat_list[group_id]["text"][i]
-				msg += f'[{time_diff}]{nickname}:{chat}\n'
-			draw.text((1380,761), f'{msg}', font=setFont, fill="#A020F0")
+				msg_list.append(f'[{time_diff}]{nickname}:{chat}')
+			draw.text((1320, 805), '\n'.join(msg_list), font=setFont_24, fill="#A020F0")
 
-		draw.text((1320, 230), f'当前{next_lap_1}周目', font=setFont, fill="#A020F0")
-
-		fighter_num_list = ['0','0','0','0','0']
-		try:
-			if load_index['clan_battle']['is_interval'] != 1:
-				for boss in battle_info['boss_info']:
-					boss_num = boss['order_num']
-					boss_lap_num = boss['lap_num']
-					boss_info2 = await query.query(account_info, '/clan_battle/boss_info', {
-						'clan_id': clan_id,
-						'clan_battle_id': clan_battle_id,
-						'lap_num': boss_lap_num,
-						'order_num': boss_num
-					})
-					fighter_num_list[int(boss_num)-1] = str(boss_info2['fighter_num'])
-		except Exception as e: logger.error(f'{str(e)}')
-		draw.text((1020,860), f'当前有{", ".join(fighter_num_list)}名玩家正在实战', font=setFont, fill="#A020F0")
 
 		width = img.size[0]		# 获取宽度
 		height = img.size[1]	# 获取高度
-		img = img.resize((int(width*1), int(height*1)), Image.ANTIALIAS)
+		img = img.resize((int(width*1), int(height*1)), Image.Resampling.LANCZOS)
 		img = p2ic2b64(img)
 		img = MessageSegment.image(img)
 		await bot.send(ev, img)
+	except Exception as e:
+		logger.exception(e)
+		await bot.send(ev, f'出现错误, 请重试:\n{str(e)}')
 
 
 @sv.on_prefix('抓人')
@@ -969,6 +1042,7 @@ async def get_battle_status(bot:HoshinoBot, ev:CQEvent):
 	if not priv.check_priv(ev, priv.ADMIN): return await bot.send(ev,'权限不足，当前指令仅管理员可用!')
 
 	await verify(bot, ev)
+	await bot.send(ev, '让我栞栞是谁还没有出刀...')
 	group_id = ev.group_id
 	group_info = secret.get_sec(group_id)
 	account_list = group_info['account_list']
@@ -985,7 +1059,7 @@ async def get_battle_status(bot:HoshinoBot, ev:CQEvent):
 		else: today = today_t[2]
 	clan_info = await query.get_clan_info(account_info)
 	clan_id = clan_info['clan']['detail']['clan_id']
-	battle_info = await query.get_clan_battle_info(account_info, clan_id, group_info['coin'])
+	battle_info = await query.get_clan_battle_info(account_info, clan_id)
 	clan_battle_id = battle_info['clan_battle_id']
 	day_sign, num, max_page, battle_history_list = 0, 0, 0, []
 	while(day_sign == 0):
@@ -1057,7 +1131,9 @@ async def get_battle_status(bot:HoshinoBot, ev:CQEvent):
 		log.append(used_time)
 		log.append(kill)
 		log.append(extra_back)
-	msg = ''
+
+	msg = []
+	bladeDict = {}
 	for members in clan_info['clan']['members']:
 		vid = members['viewer_id']
 		name = members['name']
@@ -1094,10 +1170,19 @@ async def get_battle_status(bot:HoshinoBot, ev:CQEvent):
 				else:
 					kill_acc += 0.5
 					half_sign -= 0.5
-		if kill_acc < 3:msg += f'{name}缺少{3-kill_acc}刀'
-	if msg != '':
-		msg += '\n目前暂时无法计算跨日残血boss合刀，对该部分玩家的计算会有偏差'
-		await bot.send(ev, msg)
+		if kill_acc < 3:
+			blade = str(3-kill_acc)
+			if blade not in bladeDict:
+				bladeDict[blade] = [name]
+			else:
+				bladeDict[blade].append(name)
+			# msg.append(f'【{name}】缺少{3-kill_acc}刀')
+	for blade, players in bladeDict.items():
+		msg.append(f'缺{blade}刀：{" ".join(players)}')
+	if len(msg) > 0:
+		msg.append('目前暂时无法计算跨日残血boss合刀，对该部分玩家的计算会有偏差')
+		await bot.send(ev, '\n'.join(msg))
+	else: await bot.send(ev, '所有人都出完刀辣！')
 
 
 @sv.on_prefix('sl')
@@ -1183,13 +1268,14 @@ async def rank_and_status():
 		account_info = account_list[account]
 		clan_info = await query.get_clan_info(account_info)
 		clan_id = clan_info['clan']['detail']['clan_id']
-		battle_info = await query.get_clan_battle_info(account_info, clan_id, group_info['coin'])
+		battle_info = await query.get_clan_battle_info(account_info, clan_id)
 		rank = battle_info['period_rank']
 		msg = f'当前的排名为{rank}位'
-		await cqbot.send_group_msg(group_id = group_id, self_id = group_info['bot_qqid'], message = msg)
+		if group_id in event_cache: await cqbot.send(event_cache[group_id], msg)
+		else: await cqbot.send_group_msg(group_id = int(group_id), self_id = group_info['bot_qqid'], message = msg)
 
 
-@sv.on_prefix('查档线')     #从游戏内获取数据，无数据时返回空
+@sv.on_prefix('查档线', '查公会', '查排名')     #从游戏内获取数据，无数据时返回空
 async def query_line(bot:HoshinoBot, ev:CQEvent):
 	if not priv.check_priv(ev, priv.ADMIN): return await bot.send(ev,'权限不足，当前指令仅管理员可用!')
 	goal = ev.message.extract_plain_text().strip()
@@ -1235,7 +1321,7 @@ async def query_line(bot:HoshinoBot, ev:CQEvent):
 		all_num = 0
 		clan_info = await query.get_clan_info(account_info)
 		clan_id = clan_info['clan']['detail']['clan_id']
-		battle_info = await query.get_clan_battle_info(account_info, clan_id, group_info['coin'])
+		battle_info = await query.get_clan_battle_info(account_info, clan_id)
 		clan_battle_id = battle_info['clan_battle_id']
 		for goal in goal_list:
 			goal = int(goal)
@@ -1434,7 +1520,6 @@ async def stats1(bot:HoshinoBot, ev:CQEvent):
 	await bot.send(ev, img)
 
 
-chat_list = {}
 #留言功能
 @sv.on_prefix('会战留言')
 async def chat(bot:HoshinoBot, ev:CQEvent):

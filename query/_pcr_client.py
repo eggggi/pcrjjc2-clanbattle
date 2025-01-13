@@ -15,6 +15,7 @@ import re
 from os.path import dirname, join, exists
 from os import makedirs
 from copy import deepcopy
+import asyncio
 #from ._captcha_verifier import CaptchaVerifier
 
 gs_apiRoot = 'http://le1-prod-all-gs-gzlj.bilibiligame.net'
@@ -106,7 +107,7 @@ class PcrClient:
         self._loadIndexCache = None
         self._access_key = access_key
         self._uid = uid
-        self._lock = threading.Lock()
+        self._lock = asyncio.Lock()
 
     def get_lock(self):
         return self._lock
@@ -171,7 +172,7 @@ class PcrClient:
         Returns:
             若returnDataHeader为真，返回tuple(data:dict, data_header:dict)；否则仅返回data。
         """
-        with self.get_lock():
+        async with self.get_lock():
             try:
                 if apiUrl == "/home/index" and self._homeIndexCache is not None:
                     response = self._homeIndexCache
@@ -303,5 +304,5 @@ class PcrClient:
         if not gamestart['now_tutorial']:
             raise Exception("该账号没过完教程!")
 
-        await self.CallApi('/check/check_agreement', {})
+        # await self.CallApi('/check/check_agreement', {})
         self.needLoginAndCheck = False

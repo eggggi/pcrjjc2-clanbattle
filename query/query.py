@@ -53,12 +53,12 @@ async def query(accountInfo: Union[dict, int, PcrAccountInfo], apiUrl: str, post
     return (await QueryWithHeader(accountInfo, apiUrl, postData))[0]
 
 
-async def VerifyAccount(accountInfo:dict, b_check = True) -> None:
+async def VerifyAccount(accountInfo:dict, b_check = True, clean_cache = False) -> None:
     """
     强制触发一次登录。没有返回值。
     没有抛出异常就是登录成功。
     """
-    client = PcrClientManager.FromDict(accountInfo)
+    client = PcrClientManager.FromDict(accountInfo, clean_cache)
     client._needBiliLogin = b_check
     client.needLoginAndCheck = True
     await client.LoginAndCheck()
@@ -422,7 +422,7 @@ async def get_item_or_equip_stock(account, id: int) -> int:
     return max(await get_item_stock(account, id), await get_user_equip_stock(account, id))
 
 
-async def get_clan_battle_info(account: dict, clan_id = 0, current_clan_battle_coin = 0):
+async def get_clan_battle_info(account: dict, clan_id = 0):
     """
     返回该账号的公会战状态dict。常用的有：
     {
@@ -435,9 +435,13 @@ async def get_clan_battle_info(account: dict, clan_id = 0, current_clan_battle_c
     """
     if clan_id == 0:
         clan_id = await get_clan_id(account)
-    if current_clan_battle_coin == 0:
-        current_clan_battle_coin = await get_item_stock(account, 90006)
-    return await query(account, "/clan_battle/top", {"clan_id": clan_id, "is_first": 0, "current_clan_battle_coin": current_clan_battle_coin})
+    current_clan_battle_coin = await get_item_stock(account, 90006)
+    return await query(account, "/clan_battle/top", {
+        "clan_id": clan_id,
+        "is_first": 0,
+        "current_clan_battle_coin": current_clan_battle_coin
+        }
+    )
 
 
 async def get_support_unit_setting(account):
@@ -452,6 +456,10 @@ async def get_unit_info(account, unit_id):
         if unit["id"] == unit_id:
             return unit
     raise Exception(f'该账号无角色{unit_id}')
+
+async def get_units_info(account):
+    load_index = await get_load_index(account)
+    return load_index["unit_list"]
 
 
 async def buy_stamina(account, buy_stamina_passive_max, stamina_expect, stamina_now=None) -> Tuple[str, int]:
